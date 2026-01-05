@@ -1,0 +1,275 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"fmt"
+	"log"
+	"os"
+	"sync"
+
+	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/imports/emscripten"
+	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+)
+
+// PGliteInstance manages a single PGlite WASM instance
+type PGliteInstance struct {
+	runtime wazero.Runtime
+	module  api.Module
+	memory  api.Memory
+	ctx     context.Context
+
+	// Buffers for WASM communication (mirrors TypeScript implementation)
+	outputData   []byte // Data to send to WASM
+	inputData    []byte // Data received from WASM
+	readOffset   int
+	writeOffset  int
+	keepRawResp  bool
+
+	mu sync.Mutex
+}
+
+const (
+	// Buffer sizes matching PGlite TypeScript implementation
+	defaultRecvBufSize = 1 * 1024 * 1024 // 1MB
+	maxBufferSize      = 1 << 30          // 1GB
+)
+
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.Println("PGlite WASM Port starting...")
+
+	// Check for WASM file
+	wasmPath := os.Getenv("PGLITE_WASM_PATH")
+	if wasmPath == "" {
+		wasmPath = "../priv/pglite/pglite.wasm"
+	}
+
+	if _, err := os.Stat(wasmPath); os.IsNotExist(err) {
+		log.Fatalf("WASM file not found: %s", wasmPath)
+	}
+
+	log.Printf("Loading WASM from: %s", wasmPath)
+
+	// Read WASM bytes
+	wasmBytes, err := os.ReadFile(wasmPath)
+	if err != nil {
+		log.Fatalf("Failed to read WASM file: %v", err)
+	}
+
+	log.Printf("WASM file loaded: %d bytes", len(wasmBytes))
+
+	// Create PGlite instance
+	instance, err := NewPGliteInstance(context.Background(), wasmBytes)
+	if err != nil {
+		log.Fatalf("Failed to create PGlite instance: %v", err)
+	}
+	defer instance.Close()
+
+	log.Println("PGlite instance initialized successfully")
+	log.Println("Ready to accept protocol messages on stdin")
+
+	// Main loop: read from stdin, process, write to stdout
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024) // 4MB buffer
+
+	for scanner.Scan() {
+		message := scanner.Bytes()
+
+		if len(message) == 0 {
+			continue
+		}
+
+		// Execute protocol message
+		response, err := instance.ExecProtocolRaw(message)
+		if err != nil {
+			log.Printf("Error executing protocol: %v", err)
+			// Send error response to Elixir
+			writeResponse([]byte(fmt.Sprintf("ERROR: %v", err)))
+			continue
+		}
+
+		// Send response back to Elixir
+		writeResponse(response)
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("Error reading stdin: %v", err)
+	}
+}
+
+// NewPGliteInstance creates a new PGlite WASM instance
+func NewPGliteInstance(ctx context.Context, wasmBytes []byte) (*PGliteInstance, error) {
+	inst := &PGliteInstance{
+		ctx:         ctx,
+		inputData:   make([]byte, defaultRecvBufSize),
+		outputData:  make([]byte, 0),
+		keepRawResp: true,
+	}
+
+	// Create runtime
+	runtimeConfig := wazero.NewRuntimeConfig()
+	inst.runtime = wazero.NewRuntimeWithConfig(ctx, runtimeConfig)
+
+	// Instantiate WASI
+	if _, err := wasi_snapshot_preview1.Instantiate(ctx, inst.runtime); err != nil {
+		return nil, fmt.Errorf("failed to instantiate WASI: %w", err)
+	}
+
+	// Instantiate Emscripten
+	if _, err := emscripten.NewFunctionExporterForModule(inst.runtime).
+		WithPrintln(func(msg string) {
+			log.Printf("[WASM] %s", msg)
+		}).
+		WithPrintlnErr(func(msg string) {
+			log.Printf("[WASM ERROR] %s", msg)
+		}).
+		Export(); err != nil {
+		return nil, fmt.Errorf("failed to instantiate Emscripten: %w", err)
+	}
+
+	// Compile module
+	compiledModule, err := inst.runtime.CompileModule(ctx, wasmBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile module: %w", err)
+	}
+
+	// Instantiate module with custom imports for PGlite callbacks
+	moduleConfig := wazero.NewModuleConfig().
+		WithName("pglite").
+		WithStdout(os.Stdout).
+		WithStderr(os.Stderr)
+
+	inst.module, err = inst.runtime.InstantiateModule(ctx, compiledModule, moduleConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to instantiate module: %w", err)
+	}
+
+	// Get memory
+	inst.memory = inst.module.Memory()
+	if inst.memory == nil {
+		return nil, fmt.Errorf("module has no exported memory")
+	}
+
+	log.Printf("WASM memory size: %d bytes", inst.memory.Size())
+
+	// Initialize database
+	if err := inst.initDatabase(); err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+
+	return inst, nil
+}
+
+// initDatabase calls _pgl_initdb and _pgl_backend
+// This mirrors packages/pglite/src/pglite.ts:476-521
+func (inst *PGliteInstance) initDatabase() error {
+	log.Println("Initializing PostgreSQL database...")
+
+	// Call _pgl_initdb()
+	initdb := inst.module.ExportedFunction("_pgl_initdb")
+	if initdb == nil {
+		return fmt.Errorf("_pgl_initdb function not found")
+	}
+
+	results, err := initdb.Call(inst.ctx)
+	if err != nil {
+		return fmt.Errorf("_pgl_initdb failed: %w", err)
+	}
+
+	if len(results) == 0 || results[0] == 0 {
+		return fmt.Errorf("_pgl_initdb returned 0 (failure)")
+	}
+
+	log.Println("Database initialized successfully")
+
+	// Call _pgl_backend()
+	backend := inst.module.ExportedFunction("_pgl_backend")
+	if backend == nil {
+		return fmt.Errorf("_pgl_backend function not found")
+	}
+
+	_, err = backend.Call(inst.ctx)
+	if err != nil {
+		return fmt.Errorf("_pgl_backend failed: %w", err)
+	}
+
+	log.Println("PostgreSQL backend started")
+
+	return nil
+}
+
+// ExecProtocolRaw executes a PostgreSQL wire protocol message
+// This mirrors packages/pglite/src/pglite.ts:658-681 (execProtocolRawSync)
+func (inst *PGliteInstance) ExecProtocolRaw(message []byte) ([]byte, error) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+
+	// Reset offsets
+	inst.readOffset = 0
+	inst.writeOffset = 0
+	inst.outputData = message
+
+	// Reset input buffer if needed
+	if inst.keepRawResp && len(inst.inputData) != defaultRecvBufSize {
+		inst.inputData = make([]byte, defaultRecvBufSize)
+	}
+
+	if len(message) == 0 {
+		return nil, fmt.Errorf("empty message")
+	}
+
+	// Get first byte (message type)
+	firstByte := uint64(message[0])
+	msgLength := uint64(len(message))
+
+	if inst.module == nil {
+		return nil, fmt.Errorf("WASM module not initialized")
+	}
+
+	// Call _interactive_one(message.length, message[0])
+	interactiveOne := inst.module.ExportedFunction("_interactive_one")
+	if interactiveOne == nil {
+		return nil, fmt.Errorf("_interactive_one function not found")
+	}
+
+	_, err := interactiveOne.Call(inst.ctx, msgLength, firstByte)
+	if err != nil {
+		return nil, fmt.Errorf("_interactive_one failed: %w", err)
+	}
+
+	// Clear output buffer
+	inst.outputData = nil
+
+	// Extract response from input buffer
+	if inst.keepRawResp && inst.writeOffset > 0 {
+		response := make([]byte, inst.writeOffset)
+		copy(response, inst.inputData[:inst.writeOffset])
+		return response, nil
+	}
+
+	return []byte{}, nil
+}
+
+// Close closes the WASM instance
+func (inst *PGliteInstance) Close() error {
+	if inst.runtime != nil {
+		return inst.runtime.Close(inst.ctx)
+	}
+	return nil
+}
+
+// writeResponse writes a response to stdout in the format Elixir expects
+// Format: <4 bytes length><data>
+func writeResponse(data []byte) {
+	// Write length prefix (4 bytes, big endian)
+	lengthBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthBuf, uint32(len(data)))
+
+	os.Stdout.Write(lengthBuf)
+	os.Stdout.Write(data)
+	os.Stdout.Sync()
+}

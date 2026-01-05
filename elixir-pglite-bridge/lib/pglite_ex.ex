@@ -5,7 +5,7 @@ defmodule PgliteEx do
   This module provides the main API for interacting with PGlite from Elixir.
   """
 
-  alias PgliteEx.Bridge
+  alias PgliteEx.Bridge.PortBridge
 
   @doc """
   Execute a raw PostgreSQL wire protocol message.
@@ -21,7 +21,7 @@ defmodule PgliteEx do
   """
   @spec exec_protocol_raw(binary()) :: {:ok, binary()} | {:error, term()}
   def exec_protocol_raw(message) when is_binary(message) do
-    Bridge.exec_protocol_raw(message)
+    PortBridge.exec_protocol_raw(message)
   end
 
   @doc """
@@ -49,7 +49,7 @@ defmodule PgliteEx do
   @spec ready?() :: boolean()
   def ready? do
     # Check if the bridge GenServer is running
-    case Process.whereis(Bridge) do
+    case Process.whereis(PortBridge) do
       nil -> false
       pid when is_pid(pid) -> Process.alive?(pid)
     end

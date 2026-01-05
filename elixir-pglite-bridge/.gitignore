@@ -39,3 +39,10 @@ pglite_ex-*.tar
 
 # OS
 .DS_Store
+
+# Go port artifacts
+/pglite_port/pglite-port
+/pglite_port/pglite-port-*
+/priv/pglite-port
+/priv/pglite-port-*
+go.sum

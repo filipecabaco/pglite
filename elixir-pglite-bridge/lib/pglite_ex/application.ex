@@ -21,8 +21,8 @@ defmodule PgliteEx.Application do
     debug = Keyword.get(config, :debug, 0)
 
     children = [
-      # Start the PGlite WASM bridge
-      {PgliteEx.Bridge,
+      # Start the PGlite WASM bridge (Go port)
+      {PgliteEx.Bridge.PortBridge,
        [
          wasm_path: wasm_path,
          debug: debug

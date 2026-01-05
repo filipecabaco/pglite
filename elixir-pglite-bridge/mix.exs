@@ -7,10 +7,12 @@ defmodule PgliteEx.MixProject do
       version: "0.1.0",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
+      compilers: [:pglite] ++ Mix.compilers(),
       deps: deps(),
       description: "Elixir bridge to PGlite WASM - PostgreSQL in WebAssembly",
       package: package(),
-      docs: docs()
+      docs: docs(),
+      aliases: aliases()
     ]
   end
 
@@ -45,7 +47,14 @@ defmodule PgliteEx.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md"]
+      extras: ["README.md", "ARCHITECTURE.md", "TESTING.md"]
+    ]
+  end
+
+  defp aliases do
+    [
+      # Ensure PGlite dependencies are ready before running tests
+      test: ["compile", "test"]
     ]
   end
 end

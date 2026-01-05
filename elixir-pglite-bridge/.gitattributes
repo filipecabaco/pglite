@@ -1,0 +1,20 @@
+# Git attributes for PGliteEx
+
+# Pre-built binaries - treat as binary files
+pglite_port/bin/**/* binary
+pglite_port/bin/**/* -diff
+
+# WASM files - treat as binary
+*.wasm binary
+*.wasm -diff
+
+# Elixir and Go source files
+*.ex diff=elixir
+*.exs diff=elixir
+*.go diff=go
+
+# Markdown and documentation
+*.md diff=markdown
+
+# Ensure shell scripts have LF line endings (Unix)
+*.sh text eol=lf

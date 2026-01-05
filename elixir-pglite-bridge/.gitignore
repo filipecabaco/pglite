@@ -40,9 +40,12 @@ pglite_ex-*.tar
 # OS
 .DS_Store
 
-# Go port artifacts
+# Go port artifacts (built during development)
 /pglite_port/pglite-port
 /pglite_port/pglite-port-*
+/pglite_port/bin/checksums.txt
 /priv/pglite-port
 /priv/pglite-port-*
-go.sum
+
+# Note: go.sum should be committed for reproducible builds
+# Note: pglite_port/bin/ should be committed (pre-built binaries for users)

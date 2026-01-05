@@ -6,23 +6,25 @@ Go-based port that runs PGlite WASM using Wazero runtime.
 
 This is a standalone Go binary that:
 1. Loads PGlite WASM using Wazero
-2. Initializes PostgreSQL database
-3. Reads PostgreSQL wire protocol messages from stdin
-4. Executes them against PGlite WASM
-5. Writes responses to stdout
-6. Communicates with Elixir via Port
+2. Configures filesystem mounting for persistence (memory or file-based)
+3. Initializes PostgreSQL database
+4. Reads PostgreSQL wire protocol messages from stdin
+5. Executes them against PGlite WASM
+6. Writes responses to stdout
+7. Communicates with Elixir via Erlang Port
 
 ## Why Go + Wazero?
 
-- ✅ **Built-in Emscripten support** - Works with PGlite out of the box
+- ✅ **Built-in WASI support** - Works with PGlite out of the box
+- ✅ **Filesystem mounting** - FSConfig for persistent storage
 - ✅ **Single binary** - Easy deployment, no dependencies
 - ✅ **Low memory** - ~20MB per instance
 - ✅ **Good performance** - Sufficient for database workloads
-- ✅ **Simple concurrency** - Goroutines for multiple connections
-
-See ../WASM_RUNTIME_COMPARISON.md for detailed analysis.
+- ✅ **Cross-platform** - Linux, macOS, FreeBSD support
 
 ## Build
+
+The build is automated by the Elixir Mix compiler. For manual builds:
 
 ```bash
 # Install dependencies
@@ -31,15 +33,29 @@ go mod download
 # Build
 go build -o pglite-port main.go
 
-# Or with optimizations
-go build -ldflags="-s -w" -o pglite-port main.go
+# Or with optimizations (recommended)
+go build -ldflags="-s -w" -trimpath -o pglite-port main.go
 ```
+
+## Configuration via Environment Variables
+
+The port reads configuration from environment variables:
+
+- `PGLITE_WASM_PATH` - Path to PGlite WASM file (default: `../priv/pglite/pglite.wasm`)
+- `PGLITE_DATA_DIR` - Data directory (default: `memory://`)
+  - `memory://` - In-memory (ephemeral)
+  - `./path` or `file://path` - File-based persistence
+- `PGLITE_USERNAME` - PostgreSQL username (default: `postgres`)
+- `PGLITE_DATABASE` - Database name (default: `postgres`)
+- `PGLITE_DEBUG` - Debug level 0-5 (default: `0`)
 
 ## Run Standalone (for testing)
 
 ```bash
-# Set WASM path (optional, defaults to ../priv/pglite/pglite.wasm)
+# Set configuration
 export PGLITE_WASM_PATH=../priv/pglite/pglite.wasm
+export PGLITE_DATA_DIR=memory://
+export PGLITE_DEBUG=1
 
 # Run
 ./pglite-port
@@ -52,7 +68,7 @@ echo "Q\x00\x00\x00\x0dSELECT 1\x00" | ./pglite-port
 
 ### Input (stdin)
 - PostgreSQL wire protocol messages
-- One message per line
+- Newline-delimited
 - Binary format
 
 ### Output (stdout)
@@ -61,33 +77,26 @@ echo "Q\x00\x00\x00\x0dSELECT 1\x00" | ./pglite-port
 
 ### Logging (stderr)
 - Debug and error messages
-- Safe to ignore in production
+- Controlled by `PGLITE_DEBUG` level
 
 ## Integration with Elixir
 
 The Elixir side spawns this port and communicates via stdin/stdout:
 
 ```elixir
-# In PgliteEx.Bridge
+# In PgliteEx.Bridge.PortBridge
 def init(opts) do
   port = Port.open({:spawn_executable, "priv/pglite-port"}, [
     :binary,
     :exit_status,
-    packet: 4  # 4-byte length prefix
+    {:packet, 4},  # 4-byte length prefix
+    {:env, [
+      {~c"PGLITE_WASM_PATH", wasm_path},
+      {~c"PGLITE_DATA_DIR", data_dir}
+    ]}
   ])
 
   {:ok, %{port: port}}
-end
-
-def handle_call({:exec_protocol_raw, message}, _from, state) do
-  Port.command(state.port, message)
-
-  receive do
-    {port, {:data, response}} ->
-      {:reply, {:ok, response}, state}
-  after
-    5000 -> {:reply, {:error, :timeout}, state}
-  end
 end
 ```
 
@@ -105,14 +114,31 @@ end
 ## Memory Management
 
 Each `PGliteInstance`:
-- Allocates 1MB input buffer
-- Dynamically sized output buffer
+- 1MB input buffer
+- Dynamic output buffer
 - WASM module memory (~20MB for PGlite)
 - **Total: ~21MB per instance**
 
-For 100 concurrent connections:
-- 100 instances × 21MB = ~2.1GB
-- With instance pooling: Much less!
+For multiple instances:
+- Each instance is fully isolated
+- No shared memory between instances
+- Scales linearly with instance count
+
+## Filesystem Persistence
+
+Uses Wazero's `FSConfig` for mounting host directories:
+
+```go
+// For file-based persistence
+moduleConfig.WithFSConfig(
+  wazero.NewFSConfig().WithDirMount(hostPath, "/pgdata")
+)
+```
+
+This mounts the host directory into the WASM filesystem at `/pgdata`, enabling:
+- Data persistence across restarts
+- Standard file I/O operations
+- Portable database files
 
 ## Error Handling
 
@@ -121,44 +147,47 @@ Errors are logged to stderr and sent to Elixir as:
 ERROR: <error message>
 ```
 
-Elixir can pattern match on `<<"ERROR:", _::binary>>` to handle errors.
+Elixir pattern matches on `<<"ERROR:", _::binary>>` to handle errors.
 
-## TODO
+## Cross-Platform Builds
 
-- [ ] Implement callback mechanism for `_set_read_write_cbs`
-- [ ] Add connection pooling (reuse instances)
-- [ ] Implement graceful shutdown
-- [ ] Add metrics/monitoring
-- [ ] Optimize buffer sizes based on load
-- [ ] Add configuration via environment variables
+Use `build_release.sh` to create binaries for all supported platforms:
+
+```bash
+./build_release.sh
+```
+
+Creates binaries in `bin/`:
+- `linux-amd64/pglite-port`
+- `linux-arm64/pglite-port`
+- `darwin-amd64/pglite-port`
+- `darwin-arm64/pglite-port`
 
 ## Development
 
 ```bash
-# Run tests (once implemented)
-go test ./...
-
 # Format code
 go fmt ./...
 
-# Lint
-golangci-lint run
+# Build and test
+go build -o pglite-port main.go
+echo "SELECT 1" | ./pglite-port
 ```
 
 ## Deployment
 
-Copy `pglite-port` binary to `priv/` in your Elixir app:
+Deployment is automatic via the Mix compiler:
 
-```bash
-# Build
-cd pglite_port
-go build -ldflags="-s -w" -o pglite-port main.go
+1. User adds PGliteEx as dependency
+2. Mix compiler detects platform
+3. Uses pre-built binary from `bin/` if available
+4. Falls back to building from source if Go is installed
+5. Binary copied to `_build/*/lib/pglite_ex/priv/`
 
-# Copy to Elixir priv
-cp pglite-port ../priv/
+No manual deployment steps required!
 
-# Make executable
-chmod +x ../priv/pglite-port
-```
+## Further Reading
 
-The Elixir app will find it at runtime.
+- [PACKAGING.md](../PACKAGING.md) - Distribution strategy
+- [ARCHITECTURE.md](../ARCHITECTURE.md) - System architecture
+- [Wazero Documentation](https://wazero.io/) - WASM runtime details

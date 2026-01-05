@@ -2,18 +2,56 @@ defmodule PgliteEx.Application do
   @moduledoc """
   The PgliteEx Application.
 
-  Starts the supervision tree that manages the PGlite WASM bridge
-  and the PostgreSQL wire protocol socket server.
+  Starts the supervision tree for PGlite instances. Supports two modes:
+
+  ## Single-Instance Mode (Default)
+
+  Automatically starts one PGlite instance named `:default` on application startup.
+  This is backward-compatible and requires minimal configuration.
+
+  Configuration:
+  ```elixir
+  config :pglite_ex,
+    socket_port: 5432,
+    socket_host: "127.0.0.1",
+    data_dir: "memory://",
+    wasm_path: "priv/pglite/pglite.wasm"
+  ```
+
+  ## Multi-Instance Mode
+
+  Starts only the infrastructure (Registry + DynamicSupervisor) and allows
+  instances to be started/stopped dynamically at runtime via the API.
+
+  Configuration:
+  ```elixir
+  config :pglite_ex,
+    multi_instance: true
+  ```
+
+  Then use `PgliteEx.start_instance/2` to create instances as needed.
   """
 
   use Application
   require Logger
 
+  # Configuration keys
+  @config_keys [
+    :wasm_path,
+    :socket_port,
+    :socket_host,
+    :data_dir,
+    :username,
+    :database,
+    :debug,
+    :multi_instance
+  ]
+
   @impl true
   def start(_type, _args) do
     Logger.info("Starting PgliteEx application...")
 
-    # Get configuration
+    # Load application configuration with defaults
     config = Application.get_all_env(:pglite_ex)
     wasm_path = Keyword.get(config, :wasm_path, "priv/pglite/pglite.wasm")
     socket_port = Keyword.get(config, :socket_port, 5432)
@@ -24,6 +62,7 @@ defmodule PgliteEx.Application do
     debug = Keyword.get(config, :debug, 0)
     multi_instance = Keyword.get(config, :multi_instance, false)
 
+    # Build supervision tree based on mode
     children =
       if multi_instance do
         Logger.info("Starting in multi-instance mode")
@@ -41,6 +80,7 @@ defmodule PgliteEx.Application do
         )
       end
 
+    # Start the main supervisor
     opts = [strategy: :one_for_one, name: PgliteEx.Supervisor]
     Supervisor.start_link(children, opts)
   end

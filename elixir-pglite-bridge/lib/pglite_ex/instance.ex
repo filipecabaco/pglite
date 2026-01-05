@@ -9,10 +9,23 @@ defmodule PgliteEx.Instance do
 
   Multiple instances can run simultaneously on different ports with
   independent data.
+
+  ## Architecture
+
+  Each instance creates two child processes:
+  1. `PgliteEx.Bridge.PortBridge` - Manages the Go port running WASM
+  2. `PgliteEx.SocketServer` - Accepts PostgreSQL wire protocol connections
+
+  All processes are registered in `PgliteEx.Registry` using unique names
+  derived from the instance name.
   """
 
   use Supervisor
   require Logger
+
+  # Constants for data directory configuration
+  @memory_protocol "memory://"
+  @file_protocol "file://"
 
   @doc """
   Start a PGlite instance supervisor.
@@ -104,7 +117,12 @@ defmodule PgliteEx.Instance do
   defp server_name(name), do: {:via, Registry, {PgliteEx.Registry, {:server, name}}}
 
   @doc """
-  Parse data directory configuration.
+  Parse and validate data directory configuration.
+
+  Returns one of:
+  - `{:memory, nil}` - In-memory storage (ephemeral)
+  - `{:file, path}` - File-based persistence
+  - `{:error, reason}` - Invalid configuration
 
   ## Examples
 
@@ -113,21 +131,46 @@ defmodule PgliteEx.Instance do
 
       iex> PgliteEx.Instance.parse_data_dir("./data/mydb")
       {:file, "./data/mydb"}
+
+      iex> PgliteEx.Instance.parse_data_dir("file:///tmp/db")
+      {:file, "/tmp/db"}
+
+      iex> PgliteEx.Instance.parse_data_dir("")
+      {:memory, nil}
   """
   def parse_data_dir(data_dir) when is_binary(data_dir) do
     cond do
-      data_dir == "" or String.starts_with?(data_dir, "memory://") ->
+      # Empty string or memory:// protocol means in-memory
+      is_memory_mode?(data_dir) ->
         {:memory, nil}
 
-      String.starts_with?(data_dir, "file://") ->
-        path = String.slice(data_dir, 7..-1//1)
-        {:file, path}
+      # file:// protocol prefix
+      String.starts_with?(data_dir, @file_protocol) ->
+        path = String.slice(data_dir, String.length(@file_protocol)..-1//1)
+        validate_file_path(path)
 
+      # Plain path (relative or absolute)
       true ->
-        # No prefix means file path
-        {:file, data_dir}
+        validate_file_path(data_dir)
     end
   end
 
   def parse_data_dir(_), do: {:error, "data_dir must be a string"}
+
+  # Private helpers for data directory parsing
+
+  defp is_memory_mode?(data_dir) do
+    data_dir == "" or String.starts_with?(data_dir, @memory_protocol)
+  end
+
+  defp validate_file_path(""), do: {:error, "file path cannot be empty"}
+
+  defp validate_file_path(path) when is_binary(path) do
+    # Basic validation - ensure it's not just whitespace
+    if String.trim(path) == "" do
+      {:error, "file path cannot be blank"}
+    else
+      {:file, path}
+    end
+  end
 end

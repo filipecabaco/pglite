@@ -42,8 +42,11 @@ defmodule PgliteEx.InstanceSupervisor do
   @doc """
   Start a new PGlite instance.
 
+  Creates and supervises a new isolated PGlite instance with its own WASM
+  runtime, TCP port, and data storage.
+
   ## Parameters
-    - `name` - Atom identifying this instance
+    - `name` - Atom identifying this instance (must be unique)
     - `config` - Keyword list with configuration:
       - `:port` - TCP port (required)
       - `:host` - Host to bind (default: "127.0.0.1")
@@ -51,6 +54,12 @@ defmodule PgliteEx.InstanceSupervisor do
       - `:username` - Database user (default: "postgres")
       - `:database` - Database name (default: "postgres")
       - `:debug` - Debug level (default: 0)
+
+  ## Returns
+    - `{:ok, pid}` - Instance started successfully
+    - `{:error, :port_required}` - Port not specified in config
+    - `{:error, :already_started}` - Instance with this name exists
+    - `{:error, reason}` - Other startup error
 
   ## Examples
 
@@ -67,29 +76,38 @@ defmodule PgliteEx.InstanceSupervisor do
       )
   """
   def start_instance(name, config) when is_atom(name) and is_list(config) do
-    # Validate required fields
-    unless Keyword.has_key?(config, :port) do
-      {:error, :port_required}
+    with :ok <- validate_config(config),
+         :ok <- ensure_instance_not_running(name),
+         {:ok, pid} <- start_supervised_instance(name, config) do
+      Logger.info("Started PGlite instance: #{name}")
+      {:ok, pid}
     else
-      # Check if instance already exists
-      case lookup_instance(name) do
-        {:ok, _pid} ->
-          {:error, :already_started}
-
-        {:error, :not_found} ->
-          spec = {PgliteEx.Instance, [name: name, config: config]}
-
-          case DynamicSupervisor.start_child(__MODULE__, spec) do
-            {:ok, pid} ->
-              Logger.info("Started PGlite instance: #{name}")
-              {:ok, pid}
-
-            {:error, reason} ->
-              Logger.error("Failed to start instance #{name}: #{inspect(reason)}")
-              {:error, reason}
-          end
-      end
+      {:error, reason} = error ->
+        Logger.error("Failed to start instance #{name}: #{inspect(reason)}")
+        error
     end
+  end
+
+  # Private helper functions for start_instance
+
+  defp validate_config(config) do
+    if Keyword.has_key?(config, :port) do
+      :ok
+    else
+      {:error, :port_required}
+    end
+  end
+
+  defp ensure_instance_not_running(name) do
+    case lookup_instance(name) do
+      {:ok, _pid} -> {:error, :already_started}
+      {:error, :not_found} -> :ok
+    end
+  end
+
+  defp start_supervised_instance(name, config) do
+    spec = {PgliteEx.Instance, [name: name, config: config]}
+    DynamicSupervisor.start_child(__MODULE__, spec)
   end
 
   @doc """

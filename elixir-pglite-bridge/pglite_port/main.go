@@ -37,6 +37,12 @@ const (
 	// Buffer sizes matching PGlite TypeScript implementation
 	defaultRecvBufSize = 1 * 1024 * 1024 // 1MB
 	maxBufferSize      = 1 << 30          // 1GB
+
+	// Filesystem configuration
+	wasmDataMountPoint = "/pgdata"        // Mount point inside WASM for persistent data
+	memoryProtocol     = "memory://"      // Protocol prefix for in-memory storage
+	fileProtocol       = "file://"        // Protocol prefix for file storage
+	defaultDirPerms    = 0755             // Default directory permissions
 )
 
 // Config holds PGlite configuration from environment variables
@@ -48,38 +54,48 @@ type Config struct {
 	Debug    int
 }
 
-// readConfig reads configuration from environment variables
+// readConfig reads configuration from environment variables with sensible defaults
 func readConfig() *Config {
 	config := &Config{
-		WASMPath: os.Getenv("PGLITE_WASM_PATH"),
-		DataDir:  os.Getenv("PGLITE_DATA_DIR"),
-		Username: os.Getenv("PGLITE_USERNAME"),
-		Database: os.Getenv("PGLITE_DATABASE"),
-		Debug:    0,
-	}
-
-	// Set defaults
-	if config.WASMPath == "" {
-		config.WASMPath = "../priv/pglite/pglite.wasm"
-	}
-	if config.DataDir == "" {
-		config.DataDir = "memory://"
-	}
-	if config.Username == "" {
-		config.Username = "postgres"
-	}
-	if config.Database == "" {
-		config.Database = "postgres"
-	}
-
-	// Parse debug level
-	if debugStr := os.Getenv("PGLITE_DEBUG"); debugStr != "" {
-		if debug, err := fmt.Sscanf(debugStr, "%d", &config.Debug); err == nil && debug == 1 {
-			// Successfully parsed
-		}
+		WASMPath: getEnvOrDefault("PGLITE_WASM_PATH", "../priv/pglite/pglite.wasm"),
+		DataDir:  getEnvOrDefault("PGLITE_DATA_DIR", memoryProtocol),
+		Username: getEnvOrDefault("PGLITE_USERNAME", "postgres"),
+		Database: getEnvOrDefault("PGLITE_DATABASE", "postgres"),
+		Debug:    parseDebugLevel(os.Getenv("PGLITE_DEBUG")),
 	}
 
 	return config
+}
+
+// getEnvOrDefault retrieves environment variable value or returns default
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// parseDebugLevel parses debug level from string (0-5), defaults to 0
+func parseDebugLevel(debugStr string) int {
+	if debugStr == "" {
+		return 0
+	}
+
+	var level int
+	if _, err := fmt.Sscanf(debugStr, "%d", &level); err != nil {
+		log.Printf("Warning: Invalid debug level '%s', using 0", debugStr)
+		return 0
+	}
+
+	// Clamp to valid range
+	if level < 0 {
+		return 0
+	}
+	if level > 5 {
+		return 5
+	}
+
+	return level
 }
 
 // log prints the configuration (for debugging)
@@ -92,44 +108,69 @@ func (c *Config) log() {
 	log.Printf("  Debug:     %d", c.Debug)
 }
 
-// configureFilesystem sets up filesystem mounting for the WASM module
+// configureFilesystem sets up filesystem mounting for the WASM module.
+// It supports two modes:
+//   - In-memory: dataDir is empty or "memory://" - no persistence
+//   - File-based: dataDir is a path - mounts host directory to WASM filesystem
+//
+// File paths can use "file://" prefix or be plain paths (relative or absolute).
 func configureFilesystem(moduleConfig wazero.ModuleConfig, dataDir string) error {
-	// Parse data directory
-	isMemory := dataDir == "" || dataDir == "memory://"
-
-	if isMemory {
-		log.Printf("Using in-memory filesystem (ephemeral)")
-		// No additional filesystem configuration needed for memory mode
+	// Check if using in-memory mode
+	if isMemoryMode(dataDir) {
+		log.Printf("Filesystem mode: in-memory (ephemeral - data will not persist)")
 		return nil
 	}
 
-	// Strip file:// prefix if present
-	hostPath := dataDir
-	if len(dataDir) >= 7 && dataDir[:7] == "file://" {
-		hostPath = dataDir[7:]
+	// Extract and validate the host path
+	hostPath, err := extractHostPath(dataDir)
+	if err != nil {
+		return fmt.Errorf("invalid data directory configuration: %w", err)
 	}
 
-	// Expand relative paths to absolute
+	// Expand to absolute path for clarity and reliability
 	absPath, err := filepath.Abs(hostPath)
 	if err != nil {
-		return fmt.Errorf("failed to resolve path %s: %w", hostPath, err)
+		return fmt.Errorf("failed to resolve path '%s' to absolute path: %w", hostPath, err)
 	}
 
-	// Ensure directory exists
-	if err := os.MkdirAll(absPath, 0755); err != nil {
-		return fmt.Errorf("failed to create data directory %s: %w", absPath, err)
+	// Create directory structure if it doesn't exist
+	if err := os.MkdirAll(absPath, defaultDirPerms); err != nil {
+		return fmt.Errorf("failed to create data directory '%s': %w", absPath, err)
 	}
 
-	log.Printf("Mounting host directory %s to WASM filesystem at /pgdata", absPath)
+	log.Printf("Filesystem mode: persistent")
+	log.Printf("  Host path: %s", absPath)
+	log.Printf("  WASM mount point: %s", wasmDataMountPoint)
 
-	// Mount the host directory into the WASM filesystem
-	// PGlite will see this as /pgdata inside the WASM environment
+	// Mount the host directory into the WASM filesystem using wazero's FSConfig
+	// The WASM module will see this as wasmDataMountPoint (/pgdata)
 	moduleConfig.WithFSConfig(wazero.NewFSConfig().
-		WithDirMount(absPath, "/pgdata"))
+		WithDirMount(absPath, wasmDataMountPoint))
 
-	log.Printf("File persistence enabled: data will be stored in %s", absPath)
+	log.Printf("File persistence enabled successfully")
 
 	return nil
+}
+
+// isMemoryMode checks if the data directory indicates in-memory mode
+func isMemoryMode(dataDir string) bool {
+	return dataDir == "" || dataDir == memoryProtocol
+}
+
+// extractHostPath extracts the filesystem path from a data directory string,
+// handling "file://" prefix and returning the clean path
+func extractHostPath(dataDir string) (string, error) {
+	if dataDir == "" {
+		return "", fmt.Errorf("data directory cannot be empty string")
+	}
+
+	// Strip file:// protocol prefix if present
+	if len(dataDir) > len(fileProtocol) && dataDir[:len(fileProtocol)] == fileProtocol {
+		return dataDir[len(fileProtocol):], nil
+	}
+
+	// Return as-is (could be relative or absolute path)
+	return dataDir, nil
 }
 
 func main() {

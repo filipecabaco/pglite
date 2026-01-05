@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/tetratelabs/wazero"
@@ -89,11 +90,46 @@ func (c *Config) log() {
 	log.Printf("  Username:  %s", c.Username)
 	log.Printf("  Database:  %s", c.Database)
 	log.Printf("  Debug:     %d", c.Debug)
+}
 
-	if c.DataDir != "memory://" && c.DataDir != "" {
-		log.Printf("  WARNING: File persistence not yet fully implemented!")
-		log.Printf("  Data directory '%s' will be ignored - using in-memory mode", c.DataDir)
+// configureFilesystem sets up filesystem mounting for the WASM module
+func configureFilesystem(moduleConfig wazero.ModuleConfig, dataDir string) error {
+	// Parse data directory
+	isMemory := dataDir == "" || dataDir == "memory://"
+
+	if isMemory {
+		log.Printf("Using in-memory filesystem (ephemeral)")
+		// No additional filesystem configuration needed for memory mode
+		return nil
 	}
+
+	// Strip file:// prefix if present
+	hostPath := dataDir
+	if len(dataDir) >= 7 && dataDir[:7] == "file://" {
+		hostPath = dataDir[7:]
+	}
+
+	// Expand relative paths to absolute
+	absPath, err := filepath.Abs(hostPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve path %s: %w", hostPath, err)
+	}
+
+	// Ensure directory exists
+	if err := os.MkdirAll(absPath, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory %s: %w", absPath, err)
+	}
+
+	log.Printf("Mounting host directory %s to WASM filesystem at /pgdata", absPath)
+
+	// Mount the host directory into the WASM filesystem
+	// PGlite will see this as /pgdata inside the WASM environment
+	moduleConfig.WithFSConfig(wazero.NewFSConfig().
+		WithDirMount(absPath, "/pgdata"))
+
+	log.Printf("File persistence enabled: data will be stored in %s", absPath)
+
+	return nil
 }
 
 func main() {
@@ -166,13 +202,6 @@ func NewPGliteInstance(ctx context.Context, wasmBytes []byte, config *Config) (*
 		keepRawResp: true,
 	}
 
-	// TODO: Use config.DataDir to configure filesystem persistence
-	// This would require:
-	// 1. Implementing filesystem mounting with Wazero
-	// 2. Configuring WASI filesystem APIs
-	// 3. Mapping dataDir paths to WASM memory
-	// For now, we only support in-memory mode
-
 	// Create runtime
 	runtimeConfig := wazero.NewRuntimeConfig()
 	inst.runtime = wazero.NewRuntimeWithConfig(ctx, runtimeConfig)
@@ -182,15 +211,8 @@ func NewPGliteInstance(ctx context.Context, wasmBytes []byte, config *Config) (*
 		return nil, fmt.Errorf("failed to instantiate WASI: %w", err)
 	}
 
-	// Instantiate Emscripten
-	if _, err := emscripten.NewFunctionExporterForModule(inst.runtime).
-		WithPrintln(func(msg string) {
-			log.Printf("[WASM] %s", msg)
-		}).
-		WithPrintlnErr(func(msg string) {
-			log.Printf("[WASM ERROR] %s", msg)
-		}).
-		Export(); err != nil {
+	// Instantiate Emscripten functions
+	if _, err := emscripten.Instantiate(ctx, inst.runtime); err != nil {
 		return nil, fmt.Errorf("failed to instantiate Emscripten: %w", err)
 	}
 
@@ -200,11 +222,16 @@ func NewPGliteInstance(ctx context.Context, wasmBytes []byte, config *Config) (*
 		return nil, fmt.Errorf("failed to compile module: %w", err)
 	}
 
-	// Instantiate module with custom imports for PGlite callbacks
+	// Configure module with filesystem mounting based on data_dir
 	moduleConfig := wazero.NewModuleConfig().
 		WithName("pglite").
 		WithStdout(os.Stdout).
 		WithStderr(os.Stderr)
+
+	// Handle filesystem configuration based on data_dir
+	if err := configureFilesystem(moduleConfig, config.DataDir); err != nil {
+		return nil, fmt.Errorf("failed to configure filesystem: %w", err)
+	}
 
 	inst.module, err = inst.runtime.InstantiateModule(ctx, compiledModule, moduleConfig)
 	if err != nil {

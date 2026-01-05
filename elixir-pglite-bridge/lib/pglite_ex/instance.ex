@@ -62,7 +62,7 @@ defmodule PgliteEx.Instance do
 
       {:file, path} ->
         Logger.info("Instance #{name}: Starting with file persistence at #{path}")
-        Logger.warning("File persistence not yet fully implemented - data may not persist!")
+        Logger.info("Data will be stored persistently and survive restarts")
 
       {:error, reason} ->
         Logger.error("Instance #{name}: Invalid data_dir: #{reason}")

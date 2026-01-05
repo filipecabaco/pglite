@@ -38,24 +38,80 @@ const (
 	maxBufferSize      = 1 << 30          // 1GB
 )
 
+// Config holds PGlite configuration from environment variables
+type Config struct {
+	WASMPath string
+	DataDir  string
+	Username string
+	Database string
+	Debug    int
+}
+
+// readConfig reads configuration from environment variables
+func readConfig() *Config {
+	config := &Config{
+		WASMPath: os.Getenv("PGLITE_WASM_PATH"),
+		DataDir:  os.Getenv("PGLITE_DATA_DIR"),
+		Username: os.Getenv("PGLITE_USERNAME"),
+		Database: os.Getenv("PGLITE_DATABASE"),
+		Debug:    0,
+	}
+
+	// Set defaults
+	if config.WASMPath == "" {
+		config.WASMPath = "../priv/pglite/pglite.wasm"
+	}
+	if config.DataDir == "" {
+		config.DataDir = "memory://"
+	}
+	if config.Username == "" {
+		config.Username = "postgres"
+	}
+	if config.Database == "" {
+		config.Database = "postgres"
+	}
+
+	// Parse debug level
+	if debugStr := os.Getenv("PGLITE_DEBUG"); debugStr != "" {
+		if debug, err := fmt.Sscanf(debugStr, "%d", &config.Debug); err == nil && debug == 1 {
+			// Successfully parsed
+		}
+	}
+
+	return config
+}
+
+// log prints the configuration (for debugging)
+func (c *Config) log() {
+	log.Printf("Configuration:")
+	log.Printf("  WASM Path: %s", c.WASMPath)
+	log.Printf("  Data Dir:  %s", c.DataDir)
+	log.Printf("  Username:  %s", c.Username)
+	log.Printf("  Database:  %s", c.Database)
+	log.Printf("  Debug:     %d", c.Debug)
+
+	if c.DataDir != "memory://" && c.DataDir != "" {
+		log.Printf("  WARNING: File persistence not yet fully implemented!")
+		log.Printf("  Data directory '%s' will be ignored - using in-memory mode", c.DataDir)
+	}
+}
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 	log.Println("PGlite WASM Port starting...")
 
-	// Check for WASM file
-	wasmPath := os.Getenv("PGLITE_WASM_PATH")
-	if wasmPath == "" {
-		wasmPath = "../priv/pglite/pglite.wasm"
+	// Read configuration from environment
+	config := readConfig()
+	config.log()
+
+	if _, err := os.Stat(config.WASMPath); os.IsNotExist(err) {
+		log.Fatalf("WASM file not found: %s", config.WASMPath)
 	}
 
-	if _, err := os.Stat(wasmPath); os.IsNotExist(err) {
-		log.Fatalf("WASM file not found: %s", wasmPath)
-	}
-
-	log.Printf("Loading WASM from: %s", wasmPath)
+	log.Printf("Loading WASM from: %s", config.WASMPath)
 
 	// Read WASM bytes
-	wasmBytes, err := os.ReadFile(wasmPath)
+	wasmBytes, err := os.ReadFile(config.WASMPath)
 	if err != nil {
 		log.Fatalf("Failed to read WASM file: %v", err)
 	}
@@ -63,7 +119,7 @@ func main() {
 	log.Printf("WASM file loaded: %d bytes", len(wasmBytes))
 
 	// Create PGlite instance
-	instance, err := NewPGliteInstance(context.Background(), wasmBytes)
+	instance, err := NewPGliteInstance(context.Background(), wasmBytes, config)
 	if err != nil {
 		log.Fatalf("Failed to create PGlite instance: %v", err)
 	}
@@ -102,13 +158,20 @@ func main() {
 }
 
 // NewPGliteInstance creates a new PGlite WASM instance
-func NewPGliteInstance(ctx context.Context, wasmBytes []byte) (*PGliteInstance, error) {
+func NewPGliteInstance(ctx context.Context, wasmBytes []byte, config *Config) (*PGliteInstance, error) {
 	inst := &PGliteInstance{
 		ctx:         ctx,
 		inputData:   make([]byte, defaultRecvBufSize),
 		outputData:  make([]byte, 0),
 		keepRawResp: true,
 	}
+
+	// TODO: Use config.DataDir to configure filesystem persistence
+	// This would require:
+	// 1. Implementing filesystem mounting with Wazero
+	// 2. Configuring WASI filesystem APIs
+	// 3. Mapping dataDir paths to WASM memory
+	// For now, we only support in-memory mode
 
 	// Create runtime
 	runtimeConfig := wazero.NewRuntimeConfig()

@@ -22,9 +22,18 @@ defmodule PgliteEx.Bridge.PortBridge do
 
   @doc """
   Start the port bridge GenServer.
+
+  ## Options
+    - `:name` - Process name for registration (default: __MODULE__)
+    - `:wasm_path` - Path to PGlite WASM file
+    - `:data_dir` - Data directory (default: "memory://")
+    - `:username` - PostgreSQL username (default: "postgres")
+    - `:database` - Database name (default: "postgres")
+    - `:debug` - Debug level 0-5 (default: 0)
   """
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @doc """
@@ -72,7 +81,14 @@ defmodule PgliteEx.Bridge.PortBridge do
         Logger.error("Please download PGlite WASM files - see README.md")
         {:stop, {:error, :wasm_file_not_found}}
       else
-        # Start the port
+        # Get configuration
+        data_dir = Keyword.get(opts, :data_dir, "memory://")
+        username = Keyword.get(opts, :username, "postgres")
+        database = Keyword.get(opts, :database, "postgres")
+
+        Logger.debug("Configuration: data_dir=#{data_dir}, username=#{username}, database=#{database}")
+
+        # Start the port with environment variables
         port_opts = [
           :binary,
           :exit_status,
@@ -80,7 +96,11 @@ defmodule PgliteEx.Bridge.PortBridge do
           # 4-byte length prefix
           {:env,
            [
-             {~c"PGLITE_WASM_PATH", String.to_charlist(Path.expand(wasm_path))}
+             {~c"PGLITE_WASM_PATH", String.to_charlist(Path.expand(wasm_path))},
+             {~c"PGLITE_DATA_DIR", String.to_charlist(data_dir)},
+             {~c"PGLITE_USERNAME", String.to_charlist(username)},
+             {~c"PGLITE_DATABASE", String.to_charlist(database)},
+             {~c"PGLITE_DEBUG", String.to_charlist(Integer.to_string(debug))}
            ]}
         ]
 
